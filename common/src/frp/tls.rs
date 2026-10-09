@@ -67,12 +67,53 @@ pub fn server_config() -> Result<Arc<rustls::ServerConfig>> {
 
 /// 客户端 TLS 配置：与 frp 默认行为一致，不校验服务端证书。
 pub fn client_config() -> Result<Arc<rustls::ClientConfig>> {
-    let cfg = rustls::ClientConfig::builder_with_provider(crypto_provider())
+    client_config_ex(None, None, None)
+}
+
+/// 客户端 TLS 配置（可带客户端证书 / 服务端校验）。
+///
+/// - `cert_file` + `key_file`：对应官方 frp 的 `transport.tls.certFile` /
+///   `keyFile`。服务端要求双向认证（`trustedCaFile` + 必选 client cert）时必须给，
+///   两个字段必须成对出现。
+/// - `trusted_ca_file`：对应 `transport.tls.trustedCaFile`。非空时按官方 frp 语义
+///   **校验服务端证书链与主机名**；留空则沿用 frp 默认的"不校验服务端证书"。
+pub fn client_config_ex(
+    cert_file: Option<&str>,
+    key_file: Option<&str>,
+    trusted_ca_file: Option<&str>,
+) -> Result<Arc<rustls::ClientConfig>> {
+    let cert_file = cert_file.map(str::trim).filter(|s| !s.is_empty());
+    let key_file = key_file.map(str::trim).filter(|s| !s.is_empty());
+    let trusted_ca_file = trusted_ca_file.map(str::trim).filter(|s| !s.is_empty());
+
+    let builder = rustls::ClientConfig::builder_with_provider(crypto_provider())
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-        .map_err(|e| anyhow!("TLS 协议版本配置失败：{e}"))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-        .with_no_client_auth();
+        .map_err(|e| anyhow!("TLS 协议版本配置失败：{e}"))?;
+
+    let builder = match trusted_ca_file {
+        None => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification)),
+        Some(ca) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in read_cert_chain(ca)? {
+                roots
+                    .add(cert)
+                    .map_err(|e| anyhow!("把 {ca} 里的证书加入信任库失败：{e}"))?;
+            }
+            builder.with_root_certificates(roots)
+        }
+    };
+
+    let cfg = match (cert_file, key_file) {
+        (Some(c), Some(k)) => builder
+            .with_client_auth_cert(read_cert_chain(c)?, read_private_key(k)?)
+            .with_context(|| format!("装载客户端证书 {c} + 私钥 {k} 失败"))?,
+        (None, None) => builder.with_no_client_auth(),
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("transport.tls.certFile 与 keyFile 必须成对配置");
+        }
+    };
     Ok(Arc::new(cfg))
 }
 
@@ -124,33 +165,40 @@ pub fn read_pem_blocks(path: &str) -> Result<Vec<(String, Vec<u8>)>> {
 /// frpc 这一侧**终止** TLS，所以要拿用户给的证书自己当 TLS 服务端
 /// （frp 的 https 代理与之相反：服务端只嗅探 SNI，不终止 TLS）。
 pub fn server_config_from_pem(crt_path: &str, key_path: &str) -> Result<Arc<rustls::ServerConfig>> {
-    let certs: Vec<CertificateDer<'static>> = read_pem_blocks(crt_path)?
+    let cfg = rustls::ServerConfig::builder_with_provider(crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(|e| anyhow!("TLS 协议版本配置失败：{e}"))?
+        .with_no_client_auth()
+        .with_single_cert(read_cert_chain(crt_path)?, read_private_key(key_path)?)
+        .with_context(|| format!("装载证书 {crt_path} + 私钥 {key_path} 失败"))?;
+    Ok(Arc::new(cfg))
+}
+
+/// 从 PEM 文件读证书链（`CERTIFICATE` 块，顺序保留）。
+fn read_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let certs: Vec<CertificateDer<'static>> = read_pem_blocks(path)?
         .into_iter()
         .filter(|(label, _)| label.eq_ignore_ascii_case("CERTIFICATE"))
         .map(|(_, der)| CertificateDer::from(der))
         .collect();
     if certs.is_empty() {
-        bail!("证书文件 {crt_path} 里没有 CERTIFICATE 块");
+        bail!("证书文件 {path} 里没有 CERTIFICATE 块");
     }
+    Ok(certs)
+}
 
-    let (label, der) = read_pem_blocks(key_path)?
+/// 从 PEM 文件读私钥（PKCS#8 / PKCS#1 / SEC1 三种标签都认）。
+fn read_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
+    let (label, der) = read_pem_blocks(path)?
         .into_iter()
         .find(|(label, _)| label.to_ascii_uppercase().contains("PRIVATE KEY"))
-        .ok_or_else(|| anyhow!("私钥文件 {key_path} 里没有 PRIVATE KEY 块"))?;
-    let key = match label.to_ascii_uppercase().as_str() {
+        .ok_or_else(|| anyhow!("私钥文件 {path} 里没有 PRIVATE KEY 块"))?;
+    Ok(match label.to_ascii_uppercase().as_str() {
         "PRIVATE KEY" => PrivateKeyDer::Pkcs8(der.into()),
         "RSA PRIVATE KEY" => PrivateKeyDer::Pkcs1(der.into()),
         "EC PRIVATE KEY" => PrivateKeyDer::Sec1(der.into()),
-        other => bail!("私钥文件 {key_path} 的块类型 {other} 不认识"),
-    };
-
-    let cfg = rustls::ServerConfig::builder_with_provider(crypto_provider())
-        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-        .map_err(|e| anyhow!("TLS 协议版本配置失败：{e}"))?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .with_context(|| format!("装载证书 {crt_path} + 私钥 {key_path} 失败"))?;
-    Ok(Arc::new(cfg))
+        other => bail!("私钥文件 {path} 的块类型 {other} 不认识"),
+    })
 }
 
 /// 把主机名转成 rustls 的 ServerName（IP 和域名是两种不同的变体）。
@@ -212,12 +260,30 @@ where
     }
 }
 
-/// 客户端：按需发送 frp 自定义首字节并发起 TLS 握手。
+/// 客户端：按需发送 frp 自定义首字节并发起 TLS 握手（不带客户端证书）。
 pub async fn connect_client(
+    stream: TcpStream,
+    enable: bool,
+    server_name: &str,
+    disable_custom_first_byte: bool,
+) -> Result<BoxStream> {
+    connect_client_ex(stream, enable, server_name, disable_custom_first_byte, None, None, None)
+        .await
+}
+
+/// 客户端：按需发送 frp 自定义首字节并发起 TLS 握手。
+///
+/// `cert_file` / `key_file` / `trusted_ca_file` 对应 frp 的
+/// `transport.tls.certFile` / `keyFile` / `trustedCaFile`，
+/// 空串或 `None` 表示不配置，语义见 [`client_config_ex`]。
+pub async fn connect_client_ex(
     mut stream: TcpStream,
     enable: bool,
     server_name: &str,
     disable_custom_first_byte: bool,
+    cert_file: Option<&str>,
+    key_file: Option<&str>,
+    trusted_ca_file: Option<&str>,
 ) -> Result<BoxStream> {
     if !enable {
         return Ok(Box::pin(stream));
@@ -228,7 +294,7 @@ pub async fn connect_client(
             .context("发送 frp 自定义首字节失败")?;
     }
     let name = to_server_name(server_name)?;
-    let connector = TlsConnector::from(client_config()?);
+    let connector = TlsConnector::from(client_config_ex(cert_file, key_file, trusted_ca_file)?);
     let tls = connector
         .connect(name, stream)
         .await
@@ -288,5 +354,47 @@ impl ServerCertVerifier for SkipServerVerification {
 
     fn requires_raw_public_keys(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 把自签证书写成 PEM，返回 (cert_path, key_path)。
+    fn write_self_signed(dir: &std::path::Path) -> (String, String) {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, ck.cert.pem()).unwrap();
+        std::fs::write(&key_path, ck.key_pair.serialize_pem()).unwrap();
+        (
+            cert_path.to_string_lossy().into_owned(),
+            key_path.to_string_lossy().into_owned(),
+        )
+    }
+
+    #[test]
+    fn 客户端证书必须成对配置() {
+        let err = client_config_ex(Some("/tmp/x.crt"), None, None).unwrap_err();
+        assert!(err.to_string().contains("成对"), "{err}");
+        let err = client_config_ex(None, Some("/tmp/x.key"), None).unwrap_err();
+        assert!(err.to_string().contains("成对"), "{err}");
+    }
+
+    #[test]
+    fn 空串按未配置处理() {
+        assert!(client_config_ex(Some(""), Some("  "), None).is_ok());
+    }
+
+    #[test]
+    fn 配了客户端证书与_trusted_ca_都能装上() {
+        let dir = std::env::temp_dir().join(format!("nfrp-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = write_self_signed(&dir);
+        // cert 自签，自己就是 CA
+        let cfg = client_config_ex(Some(&cert), Some(&key), Some(&cert)).expect("配置");
+        assert!(cfg.client_auth_cert_resolver.has_certs());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

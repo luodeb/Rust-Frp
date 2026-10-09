@@ -712,7 +712,16 @@ async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
     };
     // `protocol = "wss"` 自带 TLS，不用再写一遍 `transport.tls.enable`。
     let tls_on = cfg.tls_enable || cfg.websocket_tls();
-    let stream = tls::connect_client(stream, tls_on, name, !cfg.tls_custom_first_byte).await?;
+    let stream = tls::connect_client_ex(
+        stream,
+        tls_on,
+        name,
+        !cfg.tls_custom_first_byte,
+        Some(&cfg.tls_cert_file),
+        Some(&cfg.tls_key_file),
+        Some(&cfg.tls_trusted_ca_file),
+    )
+    .await?;
 
     if !cfg.websocket_enabled() {
         return Ok(stream);

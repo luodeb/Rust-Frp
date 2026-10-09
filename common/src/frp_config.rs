@@ -582,7 +582,13 @@ pub fn normalize_client(root: &mut toml::Value) {
     hoist(
         t,
         &["transport", "tls"],
-        &[("enable", "tls_enable"), ("serverName", "tls_server_name")],
+        &[
+            ("enable", "tls_enable"),
+            ("serverName", "tls_server_name"),
+            ("certFile", "tls_cert_file"),
+            ("keyFile", "tls_key_file"),
+            ("trustedCaFile", "tls_trusted_ca_file"),
+        ],
     );
     hoist_inverted_bool(
         t,

@@ -1311,6 +1311,25 @@ pub struct ClientConfig {
     #[serde(default = "default_true")]
     pub tls_custom_first_byte: bool,
 
+    /// 客户端证书链 PEM（对应 frp `transport.tls.certFile`）。
+    ///
+    /// 服务端把 `trustedCaFile` 配成 `RequireAndVerifyClientCert` 时必须给：
+    /// 少了它，TLS 握手本身能过，但服务端会在读到第一个字节前甩一个
+    /// `CertificateRequired` 告警直接断开 —— 表象是"连上就掉线"，
+    /// 从 frpc 这边看只在 yamux 层报一句 `decode error`，很难定位。
+    #[serde(default)]
+    pub tls_cert_file: String,
+
+    /// 与 [`Self::tls_cert_file`] 配对的私钥 PEM（对应 frp `transport.tls.keyFile`）。
+    #[serde(default)]
+    pub tls_key_file: String,
+
+    /// 校验服务端证书用的 CA PEM（对应 frp `transport.tls.trustedCaFile`）。
+    ///
+    /// 留空 = 沿用 frp 默认的"不校验服务端证书"。
+    #[serde(default)]
+    pub tls_trusted_ca_file: String,
+
     /// 日志级别。
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -1451,6 +1470,9 @@ impl Default for ClientConfig {
             tls_enable: false,
             tls_server_name: String::new(),
             tls_custom_first_byte: true,
+            tls_cert_file: String::new(),
+            tls_key_file: String::new(),
+            tls_trusted_ca_file: String::new(),
             log_level: default_log_level(),
             log_to: String::new(),
             max_days: default_log_max_days(),
