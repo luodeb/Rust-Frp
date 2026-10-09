@@ -12,6 +12,10 @@ readme.workspace = true
 keywords = ["frp", "proxy", "tunnel", "client", "nat"]
 categories = ["network-programming"]
 
+[lib]
+name = "nfrp_client"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nfrp-client"
 path = "src/main.rs"
