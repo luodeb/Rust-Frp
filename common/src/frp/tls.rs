@@ -117,6 +117,53 @@ pub fn client_config_ex(
     Ok(Arc::new(cfg))
 }
 
+/// [`client_config_ex`] 的内存版：证书 / 私钥 / CA 直接给 PEM 文本。
+///
+/// 给"配置整体加密打包、运行时在内存里解开"的场景用 —— 那种场景不允许把
+/// 明文 PEM 落盘再读一遍。
+pub fn client_config_ex_pem(
+    cert_pem: Option<&str>,
+    key_pem: Option<&str>,
+    trusted_ca_pem: Option<&str>,
+) -> Result<Arc<rustls::ClientConfig>> {
+    let cert_pem = cert_pem.map(str::trim).filter(|s| !s.is_empty());
+    let key_pem = key_pem.map(str::trim).filter(|s| !s.is_empty());
+    let trusted_ca_pem = trusted_ca_pem.map(str::trim).filter(|s| !s.is_empty());
+
+    let builder = rustls::ClientConfig::builder_with_provider(crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(|e| anyhow!("TLS 协议版本配置失败：{e}"))?;
+
+    let builder = match trusted_ca_pem {
+        None => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification)),
+        Some(ca) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in read_cert_chain_text(ca, "tls_trusted_ca_pem")? {
+                roots
+                    .add(cert)
+                    .map_err(|e| anyhow!("把 CA PEM 加入信任库失败：{e}"))?;
+            }
+            builder.with_root_certificates(roots)
+        }
+    };
+
+    let cfg = match (cert_pem, key_pem) {
+        (Some(c), Some(k)) => builder
+            .with_client_auth_cert(
+                read_cert_chain_text(c, "tls_cert_pem")?,
+                read_private_key_text(k, "tls_key_pem")?,
+            )
+            .with_context(|| "装载客户端证书 / 私钥 PEM 失败".to_string())?,
+        (None, None) => builder.with_no_client_auth(),
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("tls_cert_pem 与 tls_key_pem 必须成对配置");
+        }
+    };
+    Ok(Arc::new(cfg))
+}
+
 /// 读 PEM 文件，返回 `(块标签, DER 字节)` 的列表，顺序保留。
 ///
 /// 标签是 `CERTIFICATE` / `PRIVATE KEY` / `RSA PRIVATE KEY` / `EC PRIVATE KEY` 这类
@@ -126,9 +173,16 @@ pub fn client_config_ex(
 /// 这里是**唯一**一处解析 PEM 的地方：客户端插件的 `crtPath` / `keyPath`
 /// 和 OIDC 的 `trustedCaFile` 都走它，省得两处对"什么算合法 PEM"理解不一致。
 pub fn read_pem_blocks(path: &str) -> Result<Vec<(String, Vec<u8>)>> {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
     let text =
         std::fs::read_to_string(path).with_context(|| format!("读取 PEM 文件 {path} 失败"))?;
+    read_pem_blocks_text(&text, path)
+}
+
+/// [`read_pem_blocks`] 的文本版：从内存里的 PEM 文本解析，标签与 DER 顺序保留。
+///
+/// `source` 只用于错误信息（说明这段文本是谁给的），不参与解析。
+pub fn read_pem_blocks_text(text: &str, source: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     let mut out = Vec::new();
     let mut label: Option<String> = None;
     let mut b64 = String::new();
@@ -144,7 +198,7 @@ pub fn read_pem_blocks(path: &str) -> Result<Vec<(String, Vec<u8>)>> {
             if let Some(name) = label.take() {
                 let der = STANDARD
                     .decode(b64.as_bytes())
-                    .map_err(|e| anyhow!("PEM 文件 {path} 的 {name} 块不是合法 base64：{e}"))?;
+                    .map_err(|e| anyhow!("PEM {source} 的 {name} 块不是合法 base64：{e}"))?;
                 out.push((name, der));
             }
             continue;
@@ -154,7 +208,7 @@ pub fn read_pem_blocks(path: &str) -> Result<Vec<(String, Vec<u8>)>> {
         }
     }
     if out.is_empty() {
-        bail!("PEM 文件 {path} 里没有找到任何 -----BEGIN ...----- 块");
+        bail!("PEM {source} 里没有找到任何 -----BEGIN ...----- 块");
     }
     Ok(out)
 }
@@ -187,6 +241,19 @@ fn read_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
+/// [`read_cert_chain`] 的文本版。
+fn read_cert_chain_text(text: &str, source: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let certs: Vec<CertificateDer<'static>> = read_pem_blocks_text(text, source)?
+        .into_iter()
+        .filter(|(label, _)| label.eq_ignore_ascii_case("CERTIFICATE"))
+        .map(|(_, der)| CertificateDer::from(der))
+        .collect();
+    if certs.is_empty() {
+        bail!("{source} 里没有 CERTIFICATE 块");
+    }
+    Ok(certs)
+}
+
 /// 从 PEM 文件读私钥（PKCS#8 / PKCS#1 / SEC1 三种标签都认）。
 fn read_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     let (label, der) = read_pem_blocks(path)?
@@ -198,6 +265,20 @@ fn read_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
         "RSA PRIVATE KEY" => PrivateKeyDer::Pkcs1(der.into()),
         "EC PRIVATE KEY" => PrivateKeyDer::Sec1(der.into()),
         other => bail!("私钥文件 {path} 的块类型 {other} 不认识"),
+    })
+}
+
+/// [`read_private_key`] 的文本版。
+fn read_private_key_text(text: &str, source: &str) -> Result<PrivateKeyDer<'static>> {
+    let (label, der) = read_pem_blocks_text(text, source)?
+        .into_iter()
+        .find(|(label, _)| label.to_ascii_uppercase().contains("PRIVATE KEY"))
+        .ok_or_else(|| anyhow!("{source} 里没有 PRIVATE KEY 块"))?;
+    Ok(match label.to_ascii_uppercase().as_str() {
+        "PRIVATE KEY" => PrivateKeyDer::Pkcs8(der.into()),
+        "RSA PRIVATE KEY" => PrivateKeyDer::Pkcs1(der.into()),
+        "EC PRIVATE KEY" => PrivateKeyDer::Sec1(der.into()),
+        other => bail!("私钥的块类型 {other} 不认识"),
     })
 }
 
@@ -267,8 +348,16 @@ pub async fn connect_client(
     server_name: &str,
     disable_custom_first_byte: bool,
 ) -> Result<BoxStream> {
-    connect_client_ex(stream, enable, server_name, disable_custom_first_byte, None, None, None)
-        .await
+    connect_client_ex(
+        stream,
+        enable,
+        server_name,
+        disable_custom_first_byte,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 /// 客户端：按需发送 frp 自定义首字节并发起 TLS 握手。
@@ -295,6 +384,33 @@ pub async fn connect_client_ex(
     }
     let name = to_server_name(server_name)?;
     let connector = TlsConnector::from(client_config_ex(cert_file, key_file, trusted_ca_file)?);
+    let tls = connector
+        .connect(name, stream)
+        .await
+        .context("TLS 客户端握手失败")?;
+    Ok(Box::pin(tls))
+}
+
+/// [`connect_client_ex`] 的内存版：证书 / 私钥 / CA 直接给 PEM 文本。
+pub async fn connect_client_ex_pem(
+    mut stream: TcpStream,
+    enable: bool,
+    server_name: &str,
+    disable_custom_first_byte: bool,
+    cert_pem: Option<&str>,
+    key_pem: Option<&str>,
+    trusted_ca_pem: Option<&str>,
+) -> Result<BoxStream> {
+    if !enable {
+        return Ok(Box::pin(stream));
+    }
+    if !disable_custom_first_byte {
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &[FRP_TLS_HEAD_BYTE])
+            .await
+            .context("发送 frp 自定义首字节失败")?;
+    }
+    let name = to_server_name(server_name)?;
+    let connector = TlsConnector::from(client_config_ex_pem(cert_pem, key_pem, trusted_ca_pem)?);
     let tls = connector
         .connect(name, stream)
         .await
@@ -396,5 +512,29 @@ mod tests {
         let cfg = client_config_ex(Some(&cert), Some(&key), Some(&cert)).expect("配置");
         assert!(cfg.client_auth_cert_resolver.has_certs());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 文本版_证书私钥_ca_都能装上() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.pem();
+        let key = ck.key_pair.serialize_pem();
+        let cfg = client_config_ex_pem(Some(&cert), Some(&key), Some(&cert)).expect("配置");
+        assert!(cfg.client_auth_cert_resolver.has_certs());
+    }
+
+    #[test]
+    fn 文本版_证书必须成对() {
+        let err =
+            client_config_ex_pem(Some("-----BEGIN CERTIFICATE-----"), None, None).unwrap_err();
+        assert!(err.to_string().contains("成对"), "{err}");
+    }
+
+    #[test]
+    fn 文本版_坏_pem_会报错() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let key = ck.key_pair.serialize_pem();
+        let err = client_config_ex_pem(Some("not a pem"), Some(&key), None).expect_err("必须报错");
+        assert!(err.to_string().contains("PEM"), "{err}");
     }
 }

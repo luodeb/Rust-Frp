@@ -1330,6 +1330,21 @@ pub struct ClientConfig {
     #[serde(default)]
     pub tls_trusted_ca_file: String,
 
+    /// 客户端证书链 PEM **文本**（内存里直接给，不经磁盘）。
+    ///
+    /// 非空时优先于 [`Self::tls_cert_file`]。给"配置整体加密打包、运行时在内存里
+    /// 解开"的场景用 —— 那种场景不允许把明文 PEM 落盘再读一遍。
+    #[serde(default)]
+    pub tls_cert_pem: String,
+
+    /// 与 [`Self::tls_cert_pem`] 配对的私钥 PEM 文本。
+    #[serde(default)]
+    pub tls_key_pem: String,
+
+    /// 校验服务端证书用的 CA PEM 文本；非空时优先于 [`Self::tls_trusted_ca_file`]。
+    #[serde(default)]
+    pub tls_trusted_ca_pem: String,
+
     /// 日志级别。
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -1473,6 +1488,9 @@ impl Default for ClientConfig {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             tls_trusted_ca_file: String::new(),
+            tls_cert_pem: String::new(),
+            tls_key_pem: String::new(),
+            tls_trusted_ca_pem: String::new(),
             log_level: default_log_level(),
             log_to: String::new(),
             max_days: default_log_max_days(),

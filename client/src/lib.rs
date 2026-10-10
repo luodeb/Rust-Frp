@@ -712,16 +712,33 @@ async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
     };
     // `protocol = "wss"` 自带 TLS，不用再写一遍 `transport.tls.enable`。
     let tls_on = cfg.tls_enable || cfg.websocket_tls();
-    let stream = tls::connect_client_ex(
-        stream,
-        tls_on,
-        name,
-        !cfg.tls_custom_first_byte,
-        Some(&cfg.tls_cert_file),
-        Some(&cfg.tls_key_file),
-        Some(&cfg.tls_trusted_ca_file),
-    )
-    .await?;
+    // 内存里给了 PEM 文本就优先用（加密打包的场景：明文 PEM 不落盘）。
+    let has_pem = !cfg.tls_cert_pem.is_empty()
+        || !cfg.tls_key_pem.is_empty()
+        || !cfg.tls_trusted_ca_pem.is_empty();
+    let stream = if has_pem {
+        tls::connect_client_ex_pem(
+            stream,
+            tls_on,
+            name,
+            !cfg.tls_custom_first_byte,
+            Some(&cfg.tls_cert_pem),
+            Some(&cfg.tls_key_pem),
+            Some(&cfg.tls_trusted_ca_pem),
+        )
+        .await?
+    } else {
+        tls::connect_client_ex(
+            stream,
+            tls_on,
+            name,
+            !cfg.tls_custom_first_byte,
+            Some(&cfg.tls_cert_file),
+            Some(&cfg.tls_key_file),
+            Some(&cfg.tls_trusted_ca_file),
+        )
+        .await?
+    };
 
     if !cfg.websocket_enabled() {
         return Ok(stream);
